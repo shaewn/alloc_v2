@@ -38,11 +38,11 @@ typedef struct GeneralPurposeAllocator {
 } GeneralPurposeAllocator, Gpa;
 
 static size_t get_block_size(BlockHeader *b) {
-    return b->free_block.metadata & ~0xf;
+    return b->free_block.metadata & ~0xfUL;
 }
 
 static void set_block_size(BlockHeader *b, size_t size) {
-    b->free_block.metadata = size | (b->free_block.metadata & 0xfU);
+    b->free_block.metadata = size | (b->free_block.metadata & 0xfUL);
 }
 
 static bool is_allocated(BlockHeader *b) { return b->free_block.metadata & 1; }
