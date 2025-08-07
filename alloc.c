@@ -52,8 +52,12 @@ static void set_allocated(block_header_t *b, bool allocated) {
 }
 
 static heap_region_header_t *def_gpa_acquire(void *user, size_t alloc_size) {
-    return mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
+    unsigned ps = sysconf(_SC_PAGESIZE);
+    alloc_size = (alloc_size + ps - 1) / ps * ps;
+    heap_region_header_t *hdr = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANON, -1, 0);
+    hdr->size = alloc_size;
+    return hdr;
 }
 
 static void def_gpa_release(void *user, heap_region_header_t *region) {
@@ -204,9 +208,10 @@ void *gpa_alloc(gpa_t *gpa, size_t size) {
     if (!b) {
         // Allocate new memory.
         const size_t region_overhead = sizeof(heap_region_header_t);
-        size_t alloc_size = align_to_page(total_size + region_overhead);
-        heap_region_header_t *hr = gpa->acquire(gpa->user, alloc_size);
-        hr->size = alloc_size;
+        heap_region_header_t *hr = gpa->acquire(gpa->user, total_size + region_overhead);
+        if (!hr) return NULL;
+
+        size_t alloc_size = hr->size;
 
         hr->next = gpa->first_region;
         gpa->first_region = hr;
