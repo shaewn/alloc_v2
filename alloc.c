@@ -8,10 +8,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-typedef union {
+typedef union block_header {
     struct {
         size_t metadata;
-        union BlockHeader *next, *prev;
+        union block_header *next, *prev;
     } free_block;
     struct {
         size_t metadata;
