@@ -8,12 +8,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-typedef struct Allocator {
-    void *(*alloc)(void *impl, size_t size);
-    void (*free)(void *impl, void *ptr);
-} Allocator;
-
-typedef union BlockHeader {
+typedef union {
     struct {
         size_t metadata;
         union BlockHeader *next, *prev;
@@ -22,73 +17,78 @@ typedef union BlockHeader {
         size_t metadata;
         size_t canary;
     } alloc_block;
-} BlockHeader;
+} block_header_t;
 
-typedef struct HeapRegionHeader {
+typedef struct heap_region_header {
     size_t size;
-    struct HeapRegionHeader *next;
-} HeapRegionHeader;
+    struct heap_region_header *next;
+} heap_region_header_t;
 
-typedef struct GeneralPurposeAllocator {
-    HeapRegionHeader *(*acquire)(size_t size);
-    void (*release)(HeapRegionHeader *region);
+typedef struct gpa {
+    void *user;
+    heap_region_header_t *(*acquire)(void *user, size_t size);
+    void (*release)(void *user, heap_region_header_t *region);
 
-    HeapRegionHeader *first_region;
-    BlockHeader *first, *next, *last;
-} GeneralPurposeAllocator, Gpa;
+    heap_region_header_t *first_region;
+    block_header_t *first, *next, *last;
+} gpa_t;
 
-static size_t get_block_size(BlockHeader *b) {
+#define GPA_INITIALIZER(user, acq, rel) { user, acq, rel, NULL, NULL, NULL, NULL }
+#define GPA_DEF_INIT { NULL, def_gpa_acquire, def_gpa_release, NULL, NULL, NULL, NULL }
+
+static size_t get_block_size(block_header_t *b) {
     return b->free_block.metadata & ~0xfUL;
 }
 
-static void set_block_size(BlockHeader *b, size_t size) {
-    b->free_block.metadata = size | (b->free_block.metadata & 0xfUL);
+static void set_block_size(block_header_t *b, size_t size) {
+    b->free_block.metadata = size | (b->free_block.metadata & 0xf);
 }
 
-static bool is_allocated(BlockHeader *b) { return b->free_block.metadata & 1; }
+static bool is_allocated(block_header_t *b) { return b->free_block.metadata & 1; }
 
-static void set_allocated(BlockHeader *b, bool allocated) {
+static void set_allocated(block_header_t *b, bool allocated) {
     b->free_block.metadata =
-        (b->free_block.metadata & ~0xfU) | (allocated != 0);
+        (b->free_block.metadata & ~0xfULL) | (allocated != 0);
 }
 
-static HeapRegionHeader *def_gpa_acquire(size_t alloc_size) {
+static heap_region_header_t *def_gpa_acquire(void *user, size_t alloc_size) {
     return mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANON, -1, 0);
 }
 
-static void def_gpa_release(HeapRegionHeader *region) {
+static void def_gpa_release(void *user, heap_region_header_t *region) {
     munmap(region, region->size);
 }
 
-void gpa_init(Gpa *gpa) {
+void gpa_init(gpa_t *gpa, void *user, heap_region_header_t *(*acquire)(void *user, size_t size), void (*release)(void *user, heap_region_header_t *region)) {
     gpa->first_region = NULL;
     gpa->first = gpa->last = gpa->next = NULL;
-    gpa->acquire = def_gpa_acquire;
-    gpa->release = def_gpa_release;
+    gpa->user = user;
+    gpa->acquire = acquire;
+    gpa->release = release;
 }
 
-void gpa_deinit(Gpa *gpa) {
-    HeapRegionHeader *hr = gpa->first_region;
+void gpa_deinit(gpa_t *gpa) {
+    heap_region_header_t *hr = gpa->first_region;
 
     while (hr) {
-        HeapRegionHeader *next = hr->next;
+        heap_region_header_t *next = hr->next;
 
-        gpa->release(hr);
+        gpa->release(gpa->user, hr);
 
         hr = next;
     }
 }
 
-static void insert_block(Gpa *gpa, BlockHeader *b) {
-    BlockHeader *tmp = gpa->last;
+static void insert_block(gpa_t *gpa, block_header_t *b) {
+    block_header_t *tmp = gpa->last;
 
-    while (tmp && get_block_size(b) < get_block_size(tmp)) {
+    while (tmp && (uintptr_t)b < (uintptr_t)tmp) {
         tmp = tmp->free_block.prev;
     }
 
     if (tmp) {
-        BlockHeader *next = tmp->free_block.next;
+        block_header_t *next = tmp->free_block.next;
         tmp->free_block.next = b;
         b->free_block.next = next;
 
@@ -96,7 +96,7 @@ static void insert_block(Gpa *gpa, BlockHeader *b) {
             next->free_block.prev = b;
         }
     } else {
-        BlockHeader *next = gpa->first;
+        block_header_t *next = gpa->first;
         gpa->first = b;
         b->free_block.next = next;
 
@@ -112,10 +112,10 @@ static void insert_block(Gpa *gpa, BlockHeader *b) {
     }
 }
 
-static void remove_block(Gpa *gpa, BlockHeader *b) {
-    BlockHeader *prev;
+static void remove_block(gpa_t *gpa, block_header_t *b) {
+    block_header_t *prev;
     if ((prev = b->free_block.prev)) {
-        BlockHeader *next = b->free_block.next;
+        block_header_t *next = b->free_block.next;
         prev->free_block.next = next;
         if (!next) {
             gpa->last = prev;
@@ -126,14 +126,16 @@ static void remove_block(Gpa *gpa, BlockHeader *b) {
         gpa->first = b->free_block.next;
         if (!gpa->first) {
             gpa->last = NULL;
+        } else {
+            gpa->first->free_block.prev = NULL;
         }
     }
 }
 
-BlockHeader *search_until(BlockHeader *b, BlockHeader *term,
+block_header_t *search_until(block_header_t *b, block_header_t *term,
                           size_t total_size) {
     while (b != term) {
-        BlockHeader *next = b->free_block.next;
+        block_header_t *next = b->free_block.next;
 
         if (get_block_size(b) >= total_size) {
             return b;
@@ -151,65 +153,11 @@ size_t align_to_page(size_t size) {
     return (size + page_minus_one) & ~page_minus_one;
 }
 
-void *gpa_alloc(Gpa *gpa, size_t size) {
-    size = (size + 15) & ~15; // align to 16 bytes.
-    size_t total_size = size + sizeof(gpa->first->alloc_block);
-
-    BlockHeader *b = gpa->next;
-
-    b = search_until(b, NULL, total_size);
-
-    if (!b) {
-        b = search_until(gpa->first, gpa->next, total_size);
-    }
-
-    if (!b) {
-        // Allocate new memory.
-        const size_t region_overhead = sizeof(HeapRegionHeader);
-        size_t alloc_size = align_to_page(total_size + region_overhead);
-        HeapRegionHeader *hr = gpa->acquire(alloc_size);
-        hr->size = alloc_size;
-
-        hr->next = gpa->first_region;
-        gpa->first_region = hr;
-
-        b = (BlockHeader *)(hr + 1);
-        set_block_size(b, alloc_size - region_overhead);
-
-        insert_block(gpa, b);
-
-        gpa->next = NULL;
-    } else {
-        gpa->next = b->free_block.next;
-    }
-
-    // split.
-    size_t excess = get_block_size(b) - total_size;
-    if (excess >= sizeof(b->alloc_block) + 16) {
-        // split. don't need to remove the block--we shrink it.
-        BlockHeader *new_block = b;
-        b = (BlockHeader *)((char *)b + excess);
-
-        set_block_size(new_block, excess);
-    } else {
-        // need to remove the block here. didn't split.
-        remove_block(gpa, b);
-    }
-
-    if (!gpa->next) {
-        gpa->next = gpa->first;
-    }
-
-    set_allocated(b, true);
-
-    return (void *)(&b->alloc_block + 1);
-}
-
-static bool coalesce_with_next(Gpa *gpa, BlockHeader *block) {
+static bool coalesce_with_next(gpa_t *gpa, block_header_t *block) {
     if (!block)
         return false;
 
-    BlockHeader *next = block->free_block.next;
+    block_header_t *next = block->free_block.next;
 
     if (!next)
         return false;
@@ -227,14 +175,74 @@ static bool coalesce_with_next(Gpa *gpa, BlockHeader *block) {
     return true;
 }
 
-void gpa_free(Gpa *gpa, void *ptr) {
-    BlockHeader *block =
-        (BlockHeader *)((char *)ptr - sizeof(block->alloc_block));
+static void shrink_block_split_right(gpa_t *gpa, block_header_t *block, size_t new_block_size) {
+    size_t block_size = get_block_size(block);
+    size_t excess = block_size - new_block_size;
+    if (excess >= sizeof(block->alloc_block) + 16) {
+        block_header_t *new_block = (block_header_t *)((char *)block + new_block_size);
+        set_block_size(new_block, excess);
+        set_block_size(block, new_block_size);
+        insert_block(gpa, new_block);
+        // There is no need to coalesce here, since 'block' is free, and would've already been coalesced.
+        // i.e., there's no more free stuff on that end.
+    }
+}
+
+void *gpa_alloc(gpa_t *gpa, size_t size) {
+    if (size == 0) return NULL;
+    size = (size + 15) & ~15; // align to 16 bytes.
+    size_t total_size = size + sizeof(gpa->first->alloc_block);
+
+    block_header_t *b = gpa->next;
+
+    b = search_until(b, NULL, total_size);
+
+    if (!b) {
+        b = search_until(gpa->first, gpa->next, total_size);
+    }
+
+    if (!b) {
+        // Allocate new memory.
+        const size_t region_overhead = sizeof(heap_region_header_t);
+        size_t alloc_size = align_to_page(total_size + region_overhead);
+        heap_region_header_t *hr = gpa->acquire(gpa->user, alloc_size);
+        hr->size = alloc_size;
+
+        hr->next = gpa->first_region;
+        gpa->first_region = hr;
+
+        b = (block_header_t *)(hr + 1);
+        set_block_size(b, alloc_size - region_overhead);
+
+        insert_block(gpa, b);
+
+        gpa->next = NULL;
+    } else {
+        gpa->next = b->free_block.next;
+    }
+
+    // split.
+    shrink_block_split_right(gpa, b, total_size);
+
+    remove_block(gpa, b);
+
+    if (!gpa->next) {
+        gpa->next = gpa->first;
+    }
+
+    set_allocated(b, true);
+
+    return (void *)(&b->alloc_block + 1);
+}
+
+void gpa_free(gpa_t *gpa, void *ptr) {
+    block_header_t *block =
+        (block_header_t *)((char *)ptr - sizeof(block->alloc_block));
     set_allocated(block, false);
 
     insert_block(gpa, block);
 
-    BlockHeader *prev = block->free_block.prev;
+    block_header_t *prev = block->free_block.prev;
 
     if (coalesce_with_next(gpa, prev)) {
         block = prev;
@@ -243,17 +251,7 @@ void gpa_free(Gpa *gpa, void *ptr) {
     coalesce_with_next(gpa, block);
 }
 
-static void shrink_block_split_right(Gpa *gpa, BlockHeader *block, size_t new_block_size) {
-    size_t block_size = get_block_size(block);
-    size_t excess = block_size - new_block_size;
-    if (excess >= sizeof(block->alloc_block) + 16) {
-        BlockHeader *new_block = (BlockHeader *)((char *)block + excess);
-        set_block_size(new_block, excess);
-        insert_block(gpa, new_block);
-    }
-}
-
-static void *reallocate(Gpa *gpa, void *ptr, size_t old_size, size_t new_size) {
+static void *reallocate(gpa_t *gpa, void *ptr, size_t old_size, size_t new_size) {
         void *new_block = gpa_alloc(gpa, new_size);
         memcpy(new_block, ptr, old_size);
         gpa_free(gpa, ptr);
@@ -261,22 +259,21 @@ static void *reallocate(Gpa *gpa, void *ptr, size_t old_size, size_t new_size) {
         return new_block;
 }
 
-// FIXME: SOOOOO BROKEN.....
-void *gpa_realloc(Gpa *gpa, void *ptr, size_t new_size) {
-    new_size = (new_size + 15) & ~15;
-    BlockHeader *block =
-        (BlockHeader *)((char *)ptr - sizeof(block->alloc_block));
+void *gpa_realloc(gpa_t *gpa, void *ptr, size_t new_data_size) {
+    new_data_size = (new_data_size + 15) & ~15;
+    block_header_t *block =
+        (block_header_t *)((char *)ptr - sizeof(block->alloc_block));
 
-    size_t new_block_size = new_size + sizeof(block->alloc_block);
+    size_t new_block_size = new_data_size + sizeof(block->alloc_block);
 
     size_t block_size = get_block_size(block);
-    size_t old_size = block_size - sizeof(block->alloc_block);
+    size_t old_data_size = block_size - sizeof(block->alloc_block);
 
-    if (new_size == old_size) {
+    if (new_data_size == old_data_size) {
         return ptr;
     }
 
-    if (new_size < old_size) {
+    if (new_data_size < old_data_size) {
         // shrink the block.
         shrink_block_split_right(gpa, block, new_block_size);
         return ptr;
@@ -284,44 +281,40 @@ void *gpa_realloc(Gpa *gpa, void *ptr, size_t new_size) {
 
     uintptr_t next_start = (uintptr_t)block + get_block_size(block);
 
-    BlockHeader *tmp = gpa->first;
+    block_header_t *tmp = block->free_block.next;
 
-    while (tmp && (uintptr_t)tmp != next_start) {
-        tmp = tmp->free_block.next;
-    }
-
-    if (tmp) {
+    if ((uintptr_t)tmp == next_start) {
         size_t additional = get_block_size(tmp);
         size_t total = block_size + additional;
 
-        if (total < new_size) {
-            goto def;
-        } else {
+        if (total >= new_block_size) {
             // use part of the new_block.
             remove_block(gpa, tmp);
+            // the size that will be taken up by the portion we will consume.
             size_t tmp_new_block_size = new_block_size - block_size;
             shrink_block_split_right(gpa, tmp, tmp_new_block_size);
 
-            set_block_size(block, new_size);
+            set_block_size(block, new_block_size);
+
+            return ptr;
         }
     }
 
-def:
-    return reallocate(gpa, ptr, block_size - sizeof(block->alloc_block), new_size);
+    return reallocate(gpa, ptr, block_size - sizeof(block->alloc_block), new_data_size);
 }
 
-void print_heap(Gpa *gpa) {
+void print_heap(gpa_t *gpa) {
     printf("Heap Dump:\n");
     printf("Regions:\n");
 
-    HeapRegionHeader *region = gpa->first_region;
+    heap_region_header_t *region = gpa->first_region;
     while (region) {
         printf("  Region at %p, size: %zu\n", (void *)region, region->size);
         region = region->next;
     }
 
     printf("\nBlocks:\n");
-    BlockHeader *block = gpa->first;
+    block_header_t *block = gpa->first;
     while (block) {
         printf("  Block at %p, size: %zu, %s\n", (void *)block,
                get_block_size(block),
@@ -334,35 +327,29 @@ void print_heap(Gpa *gpa) {
 }
 
 int main() {
-    Gpa g;
-    gpa_init(&g);
+    gpa_t g = GPA_DEF_INIT;
 
-    int(*pints)[4][4] = gpa_alloc(&g, sizeof(int[4][4]));
+    const int num_ints = 10;
 
-    int *stuff = gpa_alloc(&g, sizeof(int));
+    int *ints = gpa_alloc(&g, sizeof(int) * num_ints);
 
-    char *huge_buf = gpa_alloc(&g, 1024);
-
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 4; c++) {
-            (*pints)[r][c] = r + c;
-        }
+    for (int i = 0; i < num_ints; i++) {
+        ints[i] = i + 1;
     }
 
     print_heap(&g);
 
-    int nread = read(STDIN_FILENO, huge_buf, 511);
-    huge_buf[nread] = 0;
+    ints = gpa_realloc(&g, ints, sizeof(int) * num_ints * 2);
 
-    printf("We read in: %s\n", huge_buf);
+    for (int i = num_ints; i < num_ints * 2; i++) {
+        ints[i] = 2 * i;
+    }
 
     print_heap(&g);
 
-    gpa_free(&g, pints);
+    gpa_free(&g, ints);
 
-    gpa_free(&g, stuff);
-
-    gpa_free(&g, huge_buf);
+    print_heap(&g);
 
     gpa_deinit(&g);
 }
