@@ -151,12 +151,6 @@ block_header_t *search_until(block_header_t *b, block_header_t *term,
     return NULL;
 }
 
-size_t align_to_page(size_t size) {
-    unsigned page = sysconf(_SC_PAGESIZE);
-    unsigned page_minus_one = page - 1;
-    return (size + page_minus_one) & ~page_minus_one;
-}
-
 static bool coalesce_with_next(gpa_t *gpa, block_header_t *block) {
     if (!block)
         return false;
