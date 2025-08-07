@@ -249,6 +249,16 @@ void gpa_free(gpa_t *gpa, void *ptr) {
     }
 
     coalesce_with_next(gpa, block);
+
+    for (heap_region_header_t **prg = &gpa->first_region; *prg; prg = &(*prg)->next) {
+        heap_region_header_t *rg = *prg;
+        if ((uintptr_t)(rg + 1) == (uintptr_t) block && (uintptr_t) rg + rg->size == (uintptr_t) block + get_block_size(block)) {
+            *prg = rg->next;
+            remove_block(gpa, block);
+            gpa->release(gpa->user, rg);
+            break;
+        }
+    }
 }
 
 static void *reallocate(gpa_t *gpa, void *ptr, size_t old_size, size_t new_size) {
